@@ -27,6 +27,13 @@ const IS_NULLABLE: u8 = 2;
 
 // ── Profiling infrastructure ────────────────────────────────────────────
 
+/// Enable profiling counters and timers in the hot path.
+/// Disabled in ReleaseFast/ReleaseSmall for maximum throughput.
+pub const enable_profiling = switch (@import("builtin").mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
+};
+
 const Timer = struct {
     start: std.time.Instant,
 
@@ -77,7 +84,8 @@ pub const DFA = struct {
     state_map: ArrayListUnmanaged(u16), // NodeId → compact index
     state_count: u16, // next index to assign
     delta: [2]ArrayListUnmanaged(NodeId), // flat transition tables [at_start], at_end=false
-    stride: u16, // = num_minterms
+    stride: u16, // = num_minterms padded to next power-of-2
+    mt_shift: std.math.Log2Int(u16), // = log2(stride), for shift-or indexing
 
     // ── at_end=true fallback (rare, ~1 per maxEnd call) ─────────────
     end_cache: std.AutoHashMapUnmanaged(TransitionKey, NodeId),
@@ -87,6 +95,11 @@ pub const DFA = struct {
     end_nullable: [2]ArrayListUnmanaged(u8), // [at_start], at_end=true
 
     pub fn init(allocator: Allocator, interner: Interner, table: MintermTable, root_id: NodeId) DFA {
+        // Pad stride to next power-of-2 for shift-or indexing
+        const raw: u16 = table.num_minterms;
+        const padded: u16 = if (raw <= 1) 1 else std.math.ceilPowerOfTwo(u16, raw) catch raw;
+        const shift: std.math.Log2Int(u16) = std.math.log2_int(u16, padded);
+
         return .{
             .interner = interner,
             .table = table,
@@ -96,7 +109,8 @@ pub const DFA = struct {
             .state_map = .empty,
             .state_count = 0,
             .delta = .{ .empty, .empty },
-            .stride = table.num_minterms,
+            .stride = padded,
+            .mt_shift = shift,
             .end_cache = .empty,
             .nullable = .{ .empty, .empty },
             .end_nullable = .{ .empty, .empty },
@@ -155,7 +169,7 @@ pub const DFA = struct {
     /// Cached nullability check. First call computes recursively and caches;
     /// subsequent calls return the cached result.
     fn cachedNullable(self: *DFA, state: NodeId, at_start: bool, at_end: bool) !bool {
-        self.profile.nullability_calls += 1;
+        if (enable_profiling) self.profile.nullability_calls += 1;
 
         const state_idx = try self.ensureState(state);
         const ctx: usize = if (at_start) 1 else 0;
@@ -168,9 +182,9 @@ pub const DFA = struct {
         }
 
         // Cache miss: compute recursively (only time the rare miss)
-        const n_start = Timer.begin();
+        const n_start = if (enable_profiling) Timer.begin() else {};
         const result = nullability_mod.isNullableAt(&self.interner, state, at_start, at_end);
-        self.profile.nullability_ns += n_start.elapsed_ns();
+        if (enable_profiling) self.profile.nullability_ns += n_start.elapsed_ns();
 
         arr.items[@intCast(state_idx)] = if (result) IS_NULLABLE else NOT_NULLABLE;
         return result;
@@ -178,19 +192,22 @@ pub const DFA = struct {
 
     /// Get the next state for (current_state, minterm, context), computing and caching if needed.
     fn transition(self: *DFA, state: NodeId, mt: u8, at_start: bool, at_end: bool) !NodeId {
-        self.profile.transition_calls += 1;
+        if (enable_profiling) self.profile.transition_calls += 1;
 
         // ── Slow path: at_end=true (rare, ~1 per maxEnd call) ───────
         if (at_end) {
             const key = TransitionKey{ .state = state, .minterm = mt, .at_start = at_start, .at_end = true };
             if (self.end_cache.get(key)) |cached| {
-                self.profile.cache_hits += 1;
+                if (enable_profiling) self.profile.cache_hits += 1;
                 return cached;
             }
-            self.profile.cache_misses += 1;
-            const d_start = Timer.begin();
+            if (enable_profiling) self.profile.cache_misses += 1;
+            const d_start = if (enable_profiling) Timer.begin() else {};
             const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, true);
-            self.profile.derivative_ns += d_start.elapsed_ns();
+            if (enable_profiling) {
+                const miss_ns = d_start.elapsed_ns();
+                self.profile.derivative_ns += miss_ns;
+            }
             try self.end_cache.put(self.allocator, key, next);
             if (next != NOTHING) {
                 _ = try self.ensureState(next);
@@ -201,22 +218,23 @@ pub const DFA = struct {
         // ── Fast path: at_end=false (99%+ of calls) ────────────────
         const state_idx = try self.ensureState(state);
         const ctx: usize = if (at_start) 1 else 0;
-        const stride: usize = @intCast(self.stride);
-        const offset: usize = @as(usize, state_idx) * stride + @as(usize, mt);
+        const offset: usize = @as(usize, state_idx) << self.mt_shift | @as(usize, mt);
 
         const cached = self.delta[ctx].items[offset];
         if (cached != SENTINEL) {
-            self.profile.cache_hits += 1;
+            if (enable_profiling) self.profile.cache_hits += 1;
             return cached;
         }
 
         // Cache miss: compute derivative and store (only time the rare miss)
-        self.profile.cache_misses += 1;
-        const d_start = Timer.begin();
+        if (enable_profiling) self.profile.cache_misses += 1;
+        const d_start = if (enable_profiling) Timer.begin() else {};
         const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, false);
-        const miss_ns = d_start.elapsed_ns();
-        self.profile.derivative_ns += miss_ns;
-        self.profile.transition_ns += miss_ns;
+        if (enable_profiling) {
+            const miss_ns = d_start.elapsed_ns();
+            self.profile.derivative_ns += miss_ns;
+            self.profile.transition_ns += miss_ns;
+        }
 
         // Ensure the result state is mapped (so future lookups work)
         if (next != NOTHING) {
