@@ -12,7 +12,9 @@ pub const dfa = @import("dfa.zig");
 /// Match a regex pattern against input, returning the leftmost-longest match span.
 /// Returns null if no match is found.
 pub const match = dfa.match;
+pub const findAll = dfa.findAll;
 pub const Span = dfa.Span;
+pub const Regex = dfa.Regex;
 
 const std = @import("std");
 

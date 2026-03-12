@@ -90,49 +90,102 @@ pub const DFA = struct {
     }
 };
 
+/// Compiled regex that can be reused across multiple inputs.
+pub const Regex = struct {
+    dfa_state: DFA,
+    allocator: Allocator,
+
+    /// Compile a regex pattern into a reusable Regex object.
+    pub fn compile(allocator: Allocator, pattern: []const u8) !Regex {
+        const expr = try parser_mod.parse(allocator, pattern);
+        defer {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        }
+
+        var interner = try Interner.init(allocator);
+        errdefer interner.deinit();
+
+        const root_id = try interner.lower(expr);
+        const table = try minterm_mod.computeMinterms(allocator, &interner, root_id);
+
+        return .{
+            .dfa_state = DFA.init(allocator, interner, table, root_id),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Regex) void {
+        self.dfa_state.deinit();
+    }
+
+    /// Find the first (leftmost-longest) match.
+    pub fn find(self: *Regex, input: []const u8) !?Span {
+        var start: usize = 0;
+        while (start <= input.len) {
+            if (try self.dfa_state.maxEnd(input, start)) |end| {
+                return Span{ .start = start, .end = end };
+            }
+            start += 1;
+        }
+        return null;
+    }
+
+    /// Find all non-overlapping leftmost-longest matches.
+    pub fn findAll(self: *Regex, allocator: Allocator, input: []const u8) ![]Span {
+        var matches: std.ArrayList(Span) = .empty;
+        errdefer matches.deinit(allocator);
+
+        var start: usize = 0;
+        while (start <= input.len) {
+            if (try self.dfa_state.maxEnd(input, start)) |end| {
+                try matches.append(allocator, Span{ .start = start, .end = end });
+                // Advance past the match; for empty matches, advance by 1
+                if (end == start) {
+                    start += 1;
+                } else {
+                    start = end;
+                }
+            } else {
+                start += 1;
+            }
+        }
+
+        return matches.toOwnedSlice(allocator);
+    }
+
+    /// Count the number of non-overlapping matches (like resharp's Count API).
+    pub fn count(self: *Regex, input: []const u8) !usize {
+        var n: usize = 0;
+        var start: usize = 0;
+        while (start <= input.len) {
+            if (try self.dfa_state.maxEnd(input, start)) |end| {
+                n += 1;
+                if (end == start) {
+                    start += 1;
+                } else {
+                    start = end;
+                }
+            } else {
+                start += 1;
+            }
+        }
+        return n;
+    }
+};
+
 /// Full pipeline: parse → intern → minterms → DFA → scan all positions → leftmost-longest.
 pub fn match(allocator: Allocator, pattern: []const u8, input: []const u8) !?Span {
-    // Parse
-    const expr = try parser_mod.parse(allocator, pattern);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var regex = try Regex.compile(allocator, pattern);
+    defer regex.deinit();
+    return regex.find(input);
+}
 
-    // Intern
-    var interner = try Interner.init(allocator);
-    errdefer interner.deinit();
-
-    const root_id = try interner.lower(expr);
-
-    // Compute minterms
-    const table = try minterm_mod.computeMinterms(allocator, &interner, root_id);
-
-    // Build DFA
-    var dfa = DFA.init(allocator, interner, table, root_id);
-    defer dfa.deinit();
-
-    // Scan all start positions for leftmost-longest match
-    var best_span: ?Span = null;
-
-    var start: usize = 0;
-    while (start <= input.len) {
-        if (try dfa.maxEnd(input, start)) |end| {
-            // Leftmost: first match we find at the earliest start
-            // Longest: maxEnd already returns the longest match at this start
-            if (best_span == null or start < best_span.?.start or
-                (start == best_span.?.start and end > best_span.?.end))
-            {
-                best_span = Span{ .start = start, .end = end };
-            }
-            // Once we found a match at this start position, no need to check later starts
-            // (leftmost wins)
-            if (best_span != null and best_span.?.start == start) break;
-        }
-        start += 1;
-    }
-
-    return best_span;
+/// Find all non-overlapping leftmost-longest matches.
+pub fn findAll(allocator: Allocator, pattern: []const u8, input: []const u8) ![]Span {
+    var regex = try Regex.compile(allocator, pattern);
+    defer regex.deinit();
+    return regex.findAll(allocator, input);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

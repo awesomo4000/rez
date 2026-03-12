@@ -393,6 +393,17 @@ pub const Parser = struct {
                     '[' => try ranges.append(self.allocator,.{ .lo = '[', .hi = '[' }),
                     '^' => try ranges.append(self.allocator,.{ .lo = '^', .hi = '^' }),
                     '-' => try ranges.append(self.allocator,.{ .lo = '-', .hi = '-' }),
+                    '.' => try ranges.append(self.allocator,.{ .lo = '.', .hi = '.' }),
+                    '(' => try ranges.append(self.allocator,.{ .lo = '(', .hi = '(' }),
+                    ')' => try ranges.append(self.allocator,.{ .lo = ')', .hi = ')' }),
+                    '{' => try ranges.append(self.allocator,.{ .lo = '{', .hi = '{' }),
+                    '}' => try ranges.append(self.allocator,.{ .lo = '}', .hi = '}' }),
+                    '*' => try ranges.append(self.allocator,.{ .lo = '*', .hi = '*' }),
+                    '+' => try ranges.append(self.allocator,.{ .lo = '+', .hi = '+' }),
+                    '?' => try ranges.append(self.allocator,.{ .lo = '?', .hi = '?' }),
+                    '|' => try ranges.append(self.allocator,.{ .lo = '|', .hi = '|' }),
+                    '_' => try ranges.append(self.allocator,.{ .lo = '_', .hi = '_' }),
+                    '$' => try ranges.append(self.allocator,.{ .lo = '$', .hi = '$' }),
                     'x' => {
                         const byte = try self.parseHexByte();
                         try ranges.append(self.allocator,.{ .lo = byte, .hi = byte });
