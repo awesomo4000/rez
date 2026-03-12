@@ -8,6 +8,7 @@ pub const minterm = @import("minterm.zig");
 pub const nullability = @import("nullability.zig");
 pub const derivative = @import("derivative.zig");
 pub const dfa = @import("dfa.zig");
+pub const startset = @import("startset.zig");
 
 /// Match a regex pattern against input, returning the leftmost-longest match span.
 /// Returns null if no match is found.

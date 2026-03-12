@@ -13,6 +13,8 @@ const MintermTable = minterm_mod.MintermTable;
 const derivative_mod = @import("derivative.zig");
 const nullability_mod = @import("nullability.zig");
 const parser_mod = @import("parser.zig");
+const startset_mod = @import("startset.zig");
+const StartSet = startset_mod.StartSet;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -261,6 +263,7 @@ pub const DFA = struct {
 pub const Regex = struct {
     dfa_state: DFA,
     allocator: Allocator,
+    startset: StartSet,
 
     /// Compile a regex pattern into a reusable Regex object.
     pub fn compile(allocator: Allocator, pattern: []const u8) !Regex {
@@ -274,11 +277,13 @@ pub const Regex = struct {
         errdefer interner.deinit();
 
         const root_id = try interner.lower(expr);
+        const startset = startset_mod.computeStartSet(&interner, root_id);
         const table = try minterm_mod.computeMinterms(allocator, &interner, root_id);
 
         return .{
             .dfa_state = DFA.init(allocator, interner, table, root_id),
             .allocator = allocator,
+            .startset = startset,
         };
     }
 
@@ -290,6 +295,12 @@ pub const Regex = struct {
     pub fn find(self: *Regex, input: []const u8) !?Span {
         var start: usize = 0;
         while (start <= input.len) {
+            // Use startset to skip to next candidate position
+            if (startset_mod.findNextCandidate(&self.startset, input, start)) |candidate| {
+                start = candidate;
+            } else {
+                break;
+            }
             if (try self.dfa_state.maxEnd(input, start)) |end| {
                 return Span{ .start = start, .end = end };
             }
@@ -305,6 +316,10 @@ pub const Regex = struct {
 
         var start: usize = 0;
         while (start <= input.len) {
+            // Use startset to skip to next candidate position
+            const candidate = startset_mod.findNextCandidate(&self.startset, input, start) orelse break;
+            start = candidate;
+
             if (try self.dfa_state.maxEnd(input, start)) |end| {
                 try matches.append(allocator, Span{ .start = start, .end = end });
                 // Advance past the match; for empty matches, advance by 1
@@ -326,6 +341,10 @@ pub const Regex = struct {
         var n: usize = 0;
         var start: usize = 0;
         while (start <= input.len) {
+            // Use startset to skip to next candidate position
+            const candidate = startset_mod.findNextCandidate(&self.startset, input, start) orelse break;
+            start = candidate;
+
             if (try self.dfa_state.maxEnd(input, start)) |end| {
                 n += 1;
                 if (end == start) {
