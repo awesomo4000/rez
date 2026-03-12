@@ -2,6 +2,7 @@
 ///
 /// Inspired by resharp-dotnet's rebar benchmark infrastructure.
 /// Measures compile time, search throughput, and match counts.
+/// Includes hot-path profiling: transition cache hit/miss, derivative, nullability timing.
 ///
 /// Run with: zig build bench
 ///
@@ -9,6 +10,7 @@ const std = @import("std");
 const rez = @import("rez");
 const Regex = rez.Regex;
 const Span = rez.Span;
+const ProfileCounters = rez.dfa.ProfileCounters;
 const Allocator = std.mem.Allocator;
 
 // ── Benchmark infrastructure ────────────────────────────────────────
@@ -22,6 +24,7 @@ const BenchResult = struct {
     match_count: usize,
     compile_throughput_mbps: f64,
     search_throughput_mbps: f64,
+    profile: ProfileCounters,
 };
 
 const Timer = struct {
@@ -64,6 +67,9 @@ fn benchCount(
     var re = try Regex.compile(allocator, pattern);
     defer re.deinit();
 
+    // -- Reset profile counters before search loop --
+    re.dfa_state.profile.reset();
+
     // -- Measure search time --
     var search_iters: u64 = 0;
     var search_total_ns: u64 = 0;
@@ -74,6 +80,9 @@ fn benchCount(
         search_total_ns += t.elapsed_ns();
         search_iters += 1;
     }
+
+    // -- Capture profile data (accumulated across all search iterations) --
+    const profile = re.dfa_state.profile;
 
     const avg_compile_ns = compile_total_ns / compile_iters;
     const avg_search_ns = search_total_ns / search_iters;
@@ -91,6 +100,7 @@ fn benchCount(
         .match_count = match_count,
         .compile_throughput_mbps = if (compile_secs > 0) haystack_mb / compile_secs else 0,
         .search_throughput_mbps = if (search_secs > 0) haystack_mb / search_secs else 0,
+        .profile = profile,
     };
 }
 
@@ -118,6 +128,21 @@ fn formatThroughput(buf: []u8, mbps: f64) []const u8 {
         return std.fmt.bufPrint(buf, "{d:.1} KB/s", .{mbps * 1024.0}) catch "???";
     } else {
         return std.fmt.bufPrint(buf, "{d:.3} MB/s", .{mbps}) catch "???";
+    }
+}
+
+fn formatCount(buf: []u8, n: u64) []const u8 {
+    if (n >= 1_000_000_000) {
+        const v: f64 = @as(f64, @floatFromInt(n)) / 1_000_000_000.0;
+        return std.fmt.bufPrint(buf, "{d:.1}B", .{v}) catch "???";
+    } else if (n >= 1_000_000) {
+        const v: f64 = @as(f64, @floatFromInt(n)) / 1_000_000.0;
+        return std.fmt.bufPrint(buf, "{d:.1}M", .{v}) catch "???";
+    } else if (n >= 1_000) {
+        const v: f64 = @as(f64, @floatFromInt(n)) / 1_000.0;
+        return std.fmt.bufPrint(buf, "{d:.1}K", .{v}) catch "???";
+    } else {
+        return std.fmt.bufPrint(buf, "{d}", .{n}) catch "???";
     }
 }
 
@@ -158,6 +183,60 @@ fn printResult(w: *std.Io.Writer, r: BenchResult) void {
         tp_str,
         r.iterations,
     });
+}
+
+fn printProfile(w: *std.Io.Writer, p: ProfileCounters, iters: u64) void {
+    const total_calls = p.transition_calls;
+    if (total_calls == 0) {
+        print(w, "  Profile: no transitions\n", .{});
+        return;
+    }
+
+    // Per-iteration averages
+    const avg_transitions = total_calls / iters;
+    const avg_nullability = p.nullability_calls / iters;
+
+    // Cache hit rate
+    const hit_rate: f64 = if (total_calls > 0)
+        @as(f64, @floatFromInt(p.cache_hits)) / @as(f64, @floatFromInt(total_calls)) * 100.0
+    else
+        0.0;
+
+    // Time breakdown as percentages of total measured time
+    // Note: transition_ns includes cache lookup + derivative time
+    // derivative_ns is the subset of transition_ns spent in derivative() on cache miss
+    // nullability_ns is measured separately (not inside transition)
+    const total_profiled_ns = p.transition_ns + p.nullability_ns;
+
+    var trans_buf: [32]u8 = undefined;
+    var null_buf: [32]u8 = undefined;
+
+    if (total_profiled_ns > 0) {
+        const cache_lookup_ns = p.transition_ns - p.derivative_ns;
+        const cache_pct: f64 = @as(f64, @floatFromInt(cache_lookup_ns)) / @as(f64, @floatFromInt(total_profiled_ns)) * 100.0;
+        const deriv_pct: f64 = @as(f64, @floatFromInt(p.derivative_ns)) / @as(f64, @floatFromInt(total_profiled_ns)) * 100.0;
+        const null_pct: f64 = @as(f64, @floatFromInt(p.nullability_ns)) / @as(f64, @floatFromInt(total_profiled_ns)) * 100.0;
+
+        const trans_str = formatCount(&trans_buf, avg_transitions);
+        const null_str = formatCount(&null_buf, avg_nullability);
+
+        print(w, "  Profile: {s} trans/iter ({d:.1}% hit), {s} null/iter | cache={d:.0}% deriv={d:.0}% null={d:.0}%\n", .{
+            trans_str,
+            hit_rate,
+            null_str,
+            cache_pct,
+            deriv_pct,
+            null_pct,
+        });
+    } else {
+        const trans_str = formatCount(&trans_buf, avg_transitions);
+        const null_str = formatCount(&null_buf, avg_nullability);
+        print(w, "  Profile: {s} trans/iter ({d:.1}% hit), {s} null/iter\n", .{
+            trans_str,
+            hit_rate,
+            null_str,
+        });
+    }
 }
 
 // ── Haystack generators ─────────────────────────────────────────────
@@ -296,8 +375,8 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const w = &stdout_writer.interface;
 
-    print(w, "rez benchmark suite\n", .{});
-    print(w, "===================\n", .{});
+    print(w, "rez benchmark suite (with profiling)\n", .{});
+    print(w, "====================================\n", .{});
 
     // ── Generate haystacks ──────────────────────────────────────
 
@@ -345,6 +424,7 @@ pub fn main() !void {
     for (literal_benches) |b| {
         const r = try benchCount(allocator, b.name, b.pattern, text_1m);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -365,6 +445,7 @@ pub fn main() !void {
     for (class_benches) |b| {
         const r = try benchCount(allocator, b.name, b.pattern, b.haystack);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -382,6 +463,7 @@ pub fn main() !void {
     for (alt_benches) |b| {
         const r = try benchCount(allocator, b.name, b.pattern, b.haystack);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -399,6 +481,7 @@ pub fn main() !void {
     for (repeat_benches) |b| {
         const r = try benchCount(allocator, b.name, b.pattern, b.haystack);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -411,11 +494,13 @@ pub fn main() !void {
     {
         const r = try benchCount(allocator, "redos-simplified-short", ".*.*=.*", redos_short);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
     {
         const r = try benchCount(allocator, "redos-simplified-long", ".*.*=.*", redos_long);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -434,6 +519,7 @@ pub fn main() !void {
     for (quad_benches) |b| {
         const r = try benchCount(allocator, b.name, ".*[^A-Z]|[A-Z]", b.haystack);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 
@@ -486,16 +572,19 @@ pub fn main() !void {
     {
         const r = try benchCount(allocator, "word-match (1KB)", scaling_pattern, text_1k);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
     {
         const r = try benchCount(allocator, "word-match (100KB)", scaling_pattern, text_100k);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
     {
         const r = try benchCount(allocator, "word-match (1MB)", scaling_pattern, text_1m);
         printResult(w, r);
+        printProfile(w, r.profile, r.iterations);
         try w.flush();
     }
 

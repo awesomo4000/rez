@@ -1,13 +1,11 @@
 /// Lazy DFA: transition table + MaxEnd matching.
-/// Caches transitions (NodeId, minterm) → NodeId.
+/// Uses flat delta tables for O(1) transition lookup and cached nullability.
 /// Provides the public match API.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const node_mod = @import("node.zig");
-const Node = node_mod.Node;
 const NodeId = node_mod.NodeId;
 const NOTHING = node_mod.NOTHING;
-const EPSILON = node_mod.EPSILON;
 const interner_mod = @import("interner.zig");
 const Interner = interner_mod.Interner;
 const minterm_mod = @import("minterm.zig");
@@ -15,6 +13,44 @@ const MintermTable = minterm_mod.MintermTable;
 const derivative_mod = @import("derivative.zig");
 const nullability_mod = @import("nullability.zig");
 const parser_mod = @import("parser.zig");
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
+
+// ── Constants ───────────────────────────────────────────────────────────
+
+const UNMAPPED: u16 = std.math.maxInt(u16);
+const SENTINEL: NodeId = std.math.maxInt(NodeId);
+const UNKNOWN_NULLABLE: u8 = 0;
+const NOT_NULLABLE: u8 = 1;
+const IS_NULLABLE: u8 = 2;
+
+// ── Profiling infrastructure ────────────────────────────────────────────
+
+const Timer = struct {
+    start: std.time.Instant,
+
+    fn begin() Timer {
+        return .{ .start = std.time.Instant.now() catch unreachable };
+    }
+
+    fn elapsed_ns(self: Timer) u64 {
+        const now = std.time.Instant.now() catch unreachable;
+        return now.since(self.start);
+    }
+};
+
+pub const ProfileCounters = struct {
+    transition_calls: u64 = 0,
+    cache_hits: u64 = 0,
+    cache_misses: u64 = 0,
+    transition_ns: u64 = 0,
+    derivative_ns: u64 = 0,
+    nullability_calls: u64 = 0,
+    nullability_ns: u64 = 0,
+
+    pub fn reset(self: *ProfileCounters) void {
+        self.* = .{};
+    }
+};
 
 pub const Span = struct {
     start: usize,
@@ -32,32 +68,160 @@ pub const DFA = struct {
     interner: Interner,
     table: MintermTable,
     root_id: NodeId,
-    cache: std.AutoHashMapUnmanaged(TransitionKey, NodeId),
     allocator: Allocator,
+    profile: ProfileCounters = .{},
+
+    // ── Flat delta table (replaces HashMap cache) ───────────────────
+    state_map: ArrayListUnmanaged(u16), // NodeId → compact index
+    state_count: u16, // next index to assign
+    delta: [2]ArrayListUnmanaged(NodeId), // flat transition tables [at_start], at_end=false
+    stride: u16, // = num_minterms
+
+    // ── at_end=true fallback (rare, ~1 per maxEnd call) ─────────────
+    end_cache: std.AutoHashMapUnmanaged(TransitionKey, NodeId),
+
+    // ── Nullable cache (replaces recursive tree walk) ───────────────
+    nullable: [2]ArrayListUnmanaged(u8), // [at_start], at_end=false
+    end_nullable: [2]ArrayListUnmanaged(u8), // [at_start], at_end=true
 
     pub fn init(allocator: Allocator, interner: Interner, table: MintermTable, root_id: NodeId) DFA {
         return .{
             .interner = interner,
             .table = table,
             .root_id = root_id,
-            .cache = .empty,
             .allocator = allocator,
+            .profile = .{},
+            .state_map = .empty,
+            .state_count = 0,
+            .delta = .{ .empty, .empty },
+            .stride = table.num_minterms,
+            .end_cache = .empty,
+            .nullable = .{ .empty, .empty },
+            .end_nullable = .{ .empty, .empty },
         };
     }
 
     pub fn deinit(self: *DFA) void {
-        self.cache.deinit(self.allocator);
+        self.state_map.deinit(self.allocator);
+        for (0..2) |i| {
+            self.delta[i].deinit(self.allocator);
+            self.nullable[i].deinit(self.allocator);
+            self.end_nullable[i].deinit(self.allocator);
+        }
+        self.end_cache.deinit(self.allocator);
         self.interner.deinit();
+    }
+
+    /// Map a NodeId to a compact sequential index, growing tables as needed.
+    fn ensureState(self: *DFA, node_id: NodeId) !u16 {
+        const id: usize = @intCast(node_id);
+
+        // Grow state_map to cover this NodeId if needed
+        if (id >= self.state_map.items.len) {
+            const old_len = self.state_map.items.len;
+            const new_len = id + 1;
+            try self.state_map.resize(self.allocator, new_len);
+            @memset(self.state_map.items[old_len..new_len], UNMAPPED);
+        }
+
+        // If already mapped, return existing index
+        const existing = self.state_map.items[id];
+        if (existing != UNMAPPED) return existing;
+
+        // Assign new compact index
+        const idx = self.state_count;
+        self.state_count += 1;
+        self.state_map.items[id] = idx;
+
+        // Grow delta tables by one row (stride entries filled with SENTINEL)
+        const stride: usize = @intCast(self.stride);
+        for (0..2) |ctx| {
+            const old_delta_len = self.delta[ctx].items.len;
+            try self.delta[ctx].resize(self.allocator, old_delta_len + stride);
+            @memset(self.delta[ctx].items[old_delta_len..], SENTINEL);
+        }
+
+        // Grow nullable arrays by 1 entry (filled with UNKNOWN)
+        for (0..2) |ctx| {
+            try self.nullable[ctx].append(self.allocator, UNKNOWN_NULLABLE);
+            try self.end_nullable[ctx].append(self.allocator, UNKNOWN_NULLABLE);
+        }
+
+        return idx;
+    }
+
+    /// Cached nullability check. First call computes recursively and caches;
+    /// subsequent calls return the cached result.
+    fn cachedNullable(self: *DFA, state: NodeId, at_start: bool, at_end: bool) !bool {
+        self.profile.nullability_calls += 1;
+
+        const state_idx = try self.ensureState(state);
+        const ctx: usize = if (at_start) 1 else 0;
+
+        const arr = if (at_end) &self.end_nullable[ctx] else &self.nullable[ctx];
+        const cached = arr.items[@intCast(state_idx)];
+
+        if (cached != UNKNOWN_NULLABLE) {
+            return cached == IS_NULLABLE;
+        }
+
+        // Cache miss: compute recursively (only time the rare miss)
+        const n_start = Timer.begin();
+        const result = nullability_mod.isNullableAt(&self.interner, state, at_start, at_end);
+        self.profile.nullability_ns += n_start.elapsed_ns();
+
+        arr.items[@intCast(state_idx)] = if (result) IS_NULLABLE else NOT_NULLABLE;
+        return result;
     }
 
     /// Get the next state for (current_state, minterm, context), computing and caching if needed.
     fn transition(self: *DFA, state: NodeId, mt: u8, at_start: bool, at_end: bool) !NodeId {
-        const key = TransitionKey{ .state = state, .minterm = mt, .at_start = at_start, .at_end = at_end };
-        if (self.cache.get(key)) |cached| {
+        self.profile.transition_calls += 1;
+
+        // ── Slow path: at_end=true (rare, ~1 per maxEnd call) ───────
+        if (at_end) {
+            const key = TransitionKey{ .state = state, .minterm = mt, .at_start = at_start, .at_end = true };
+            if (self.end_cache.get(key)) |cached| {
+                self.profile.cache_hits += 1;
+                return cached;
+            }
+            self.profile.cache_misses += 1;
+            const d_start = Timer.begin();
+            const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, true);
+            self.profile.derivative_ns += d_start.elapsed_ns();
+            try self.end_cache.put(self.allocator, key, next);
+            if (next != NOTHING) {
+                _ = try self.ensureState(next);
+            }
+            return next;
+        }
+
+        // ── Fast path: at_end=false (99%+ of calls) ────────────────
+        const state_idx = try self.ensureState(state);
+        const ctx: usize = if (at_start) 1 else 0;
+        const stride: usize = @intCast(self.stride);
+        const offset: usize = @as(usize, state_idx) * stride + @as(usize, mt);
+
+        const cached = self.delta[ctx].items[offset];
+        if (cached != SENTINEL) {
+            self.profile.cache_hits += 1;
             return cached;
         }
-        const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, at_end);
-        try self.cache.put(self.allocator, key, next);
+
+        // Cache miss: compute derivative and store (only time the rare miss)
+        self.profile.cache_misses += 1;
+        const d_start = Timer.begin();
+        const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, false);
+        const miss_ns = d_start.elapsed_ns();
+        self.profile.derivative_ns += miss_ns;
+        self.profile.transition_ns += miss_ns;
+
+        // Ensure the result state is mapped (so future lookups work)
+        if (next != NOTHING) {
+            _ = try self.ensureState(next);
+        }
+
+        self.delta[ctx].items[offset] = next;
         return next;
     }
 
@@ -69,7 +233,9 @@ pub const DFA = struct {
         // Check if the pattern is nullable at start position (empty match possible)
         const at_start = (start == 0);
         const at_end = (start == input.len);
-        var best: ?usize = if (nullability_mod.isNullableAt(&self.interner, state, at_start, at_end)) start else null;
+
+        const initially_nullable = try self.cachedNullable(state, at_start, at_end);
+        var best: ?usize = if (initially_nullable) start else null;
 
         var pos = start;
         while (pos < input.len) {
@@ -81,7 +247,8 @@ pub const DFA = struct {
 
             pos += 1;
 
-            if (nullability_mod.isNullableAt(&self.interner, state, at_start, pos == input.len)) {
+            const nullable = try self.cachedNullable(state, at_start, pos == input.len);
+            if (nullable) {
                 best = pos;
             }
         }
