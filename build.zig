@@ -51,4 +51,21 @@ pub fn build(b: *std.Build) void {
 
     const compat_step = b.step("test-compat", "Run resharp compatibility tests");
     compat_step.dependOn(&run_compat_tests.step);
+
+    // Benchmark executable — always built in ReleaseFast for accurate measurements
+    const bench_exe = b.addExecutable(.{
+        .name = "rez-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "rez", .module = mod },
+            },
+        }),
+    });
+
+    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    bench_step.dependOn(&bench_cmd.step);
 }

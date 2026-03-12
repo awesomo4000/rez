@@ -253,6 +253,13 @@ pub const Parser = struct {
 
     fn parseGroup(self: *Parser) ParseError!*Expr {
         _ = self.advance(); // consume '('
+
+        // Handle (?:...) non-capturing group — we treat all groups as non-capturing
+        // anyway, so just skip the ?: prefix
+        if (self.pos + 1 < self.source.len and self.source[self.pos] == '?' and self.source[self.pos + 1] == ':') {
+            self.pos += 2; // skip '?:'
+        }
+
         const inner = try self.parseAlternation();
         if (self.peek() != ')') {
             inner.deinit(self.allocator);
@@ -1169,4 +1176,52 @@ test "parse escaped underscore is literal" {
         allocator.destroy(e);
     }
     try expectLiteral(e, '_');
+}
+
+test "parse non-capturing group (?:abc)" {
+    const allocator = testing.allocator;
+    const e = try parse(allocator, "(?:abc)");
+    defer {
+        e.deinit(allocator);
+        allocator.destroy(e);
+    }
+    // (?:abc) should parse the same as (abc) — a concat of a, b, c
+    switch (e.*) {
+        .concat => {}, // expected
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse non-capturing group with quantifier (?:ab){2,3}" {
+    const allocator = testing.allocator;
+    const e = try parse(allocator, "(?:ab){2,3}");
+    defer {
+        e.deinit(allocator);
+        allocator.destroy(e);
+    }
+    switch (e.*) {
+        .repeat => |r| {
+            try testing.expectEqual(@as(u32, 2), r.min);
+            try testing.expectEqual(@as(?u32, 3), r.max);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse nested non-capturing group (?:a|b)+" {
+    const allocator = testing.allocator;
+    const e = try parse(allocator, "(?:a|b)+");
+    defer {
+        e.deinit(allocator);
+        allocator.destroy(e);
+    }
+    switch (e.*) {
+        .plus => |p| {
+            switch (p.child.*) {
+                .alternation => {}, // expected
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
