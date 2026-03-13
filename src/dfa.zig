@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const node_mod = @import("node.zig");
 const NodeId = node_mod.NodeId;
 const NOTHING = node_mod.NOTHING;
+const ANYSTAR = node_mod.ANYSTAR;
 const interner_mod = @import("interner.zig");
 const Interner = interner_mod.Interner;
 const minterm_mod = @import("minterm.zig");
@@ -15,6 +16,7 @@ const nullability_mod = @import("nullability.zig");
 const parser_mod = @import("parser.zig");
 const startset_mod = @import("startset.zig");
 const StartSet = startset_mod.StartSet;
+const reverse_mod = @import("reverse.zig");
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -74,8 +76,8 @@ const TransitionKey = struct {
 };
 
 pub const DFA = struct {
-    interner: Interner,
-    table: MintermTable,
+    interner: *Interner,
+    table: *const MintermTable,
     root_id: NodeId,
     allocator: Allocator,
     profile: ProfileCounters = .{},
@@ -94,7 +96,7 @@ pub const DFA = struct {
     nullable: [2]ArrayListUnmanaged(u8), // [at_start], at_end=false
     end_nullable: [2]ArrayListUnmanaged(u8), // [at_start], at_end=true
 
-    pub fn init(allocator: Allocator, interner: Interner, table: MintermTable, root_id: NodeId) DFA {
+    pub fn init(allocator: Allocator, interner: *Interner, table: *const MintermTable, root_id: NodeId) DFA {
         // Pad stride to next power-of-2 for shift-or indexing
         const raw: u16 = table.num_minterms;
         const padded: u16 = if (raw <= 1) 1 else std.math.ceilPowerOfTwo(u16, raw) catch raw;
@@ -125,7 +127,6 @@ pub const DFA = struct {
             self.end_nullable[i].deinit(self.allocator);
         }
         self.end_cache.deinit(self.allocator);
-        self.interner.deinit();
     }
 
     /// Map a NodeId to a compact sequential index, growing tables as needed.
@@ -183,7 +184,7 @@ pub const DFA = struct {
 
         // Cache miss: compute recursively (only time the rare miss)
         const n_start = if (enable_profiling) Timer.begin() else {};
-        const result = nullability_mod.isNullableAt(&self.interner, state, at_start, at_end);
+        const result = nullability_mod.isNullableAt(self.interner, state, at_start, at_end);
         if (enable_profiling) self.profile.nullability_ns += n_start.elapsed_ns();
 
         arr.items[@intCast(state_idx)] = if (result) IS_NULLABLE else NOT_NULLABLE;
@@ -203,7 +204,7 @@ pub const DFA = struct {
             }
             if (enable_profiling) self.profile.cache_misses += 1;
             const d_start = if (enable_profiling) Timer.begin() else {};
-            const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, true);
+            const next = try derivative_mod.derivative(self.interner, state, mt, at_start, true);
             if (enable_profiling) {
                 const miss_ns = d_start.elapsed_ns();
                 self.profile.derivative_ns += miss_ns;
@@ -229,7 +230,7 @@ pub const DFA = struct {
         // Cache miss: compute derivative and store (only time the rare miss)
         if (enable_profiling) self.profile.cache_misses += 1;
         const d_start = if (enable_profiling) Timer.begin() else {};
-        const next = try derivative_mod.derivative(&self.interner, state, mt, at_start, false);
+        const next = try derivative_mod.derivative(self.interner, state, mt, at_start, false);
         if (enable_profiling) {
             const miss_ns = d_start.elapsed_ns();
             self.profile.derivative_ns += miss_ns;
@@ -275,11 +276,59 @@ pub const DFA = struct {
 
         return best;
     }
+
+    /// Reverse scan: find all candidate match start positions by scanning right-to-left.
+    /// The DFA root should be ANYSTAR ∘ reverse(pattern).
+    /// `starts` must have length input.len + 1 (one entry per possible start position).
+    pub fn findStarts(self: *DFA, input: []const u8, starts: []bool) !void {
+        var state = self.root_id;
+
+        // We scan right-to-left through the input. This is equivalent to a
+        // forward scan of the reversed input through the reversed DFA.
+        //
+        // In the reversed scan:
+        //   - "at_start" (of the reversed scan) = at the right edge of the original input
+        //   - "at_end"   (of the reversed scan) = at position 0 (left edge of original)
+        //
+        // Since reverseNode already swapped anchor_start↔anchor_end, the
+        // nullability/derivative code handles this correctly when we pass
+        // the scan-direction-relative at_start/at_end flags.
+
+        // Before consuming any characters, we're at the "start" of the reversed scan
+        // (= right edge of original input). Check if nullable here.
+        const is_at_rev_start = true;
+        const is_at_rev_end = (input.len == 0);
+        if (try self.cachedNullable(state, is_at_rev_start, is_at_rev_end)) {
+            starts[input.len] = true;
+        }
+
+        // Scan right-to-left: feed input[pos] for pos = len-1 down to 0
+        var i: usize = input.len;
+        while (i > 0) {
+            i -= 1;
+            const mt = self.table.getMintermForChar(input[i]);
+            // After consuming this character, have we reached the "end" of the reversed scan?
+            const rev_at_end = (i == 0);
+            state = try self.transition(state, mt, is_at_rev_start, rev_at_end);
+
+            if (state == NOTHING) break;
+
+            if (try self.cachedNullable(state, is_at_rev_start, rev_at_end)) {
+                starts[i] = true;
+            }
+        }
+    }
 };
 
 /// Compiled regex that can be reused across multiple inputs.
+/// Uses a two-phase algorithm (llmatch):
+///   Phase 1: right-to-left scan with reversed DFA to find candidate starts
+///   Phase 2: forward maxEnd() from each candidate to find match ends
 pub const Regex = struct {
-    dfa_state: DFA,
+    interner: *Interner,
+    table: *MintermTable,
+    fwd_dfa: DFA,
+    rev_dfa: DFA,
     allocator: Allocator,
     startset: StartSet,
 
@@ -291,89 +340,150 @@ pub const Regex = struct {
             allocator.destroy(expr);
         }
 
-        var interner = try Interner.init(allocator);
+        // Heap-allocate interner and table so DFA pointers remain stable
+        const interner = try allocator.create(Interner);
+        errdefer allocator.destroy(interner);
+        interner.* = try Interner.init(allocator);
         errdefer interner.deinit();
 
         const root_id = try interner.lower(expr);
-        const startset = startset_mod.computeStartSet(&interner, root_id);
-        const table = try minterm_mod.computeMinterms(allocator, &interner, root_id);
+        const startset = startset_mod.computeStartSet(interner, root_id);
+
+        // Build reversed root: ANYSTAR ∘ reverse(pattern)
+        const rev_root = try reverse_mod.reverseNode(interner, root_id);
+        const rev_starred = try interner.intern(.{ .concat = .{
+            .left = ANYSTAR,
+            .right = rev_root,
+        } });
+
+        // Compute minterms from both roots so they share one partition.
+        // We build a synthetic alt(fwd, rev) to collect all predicates.
+        const both_children = try interner.allocChildren(&.{ root_id, rev_starred });
+        const combined = try interner.intern(.{ .alternation = .{ .children = both_children } });
+
+        const table = try allocator.create(MintermTable);
+        errdefer allocator.destroy(table);
+        table.* = try minterm_mod.computeMinterms(allocator, interner, combined);
 
         return .{
-            .dfa_state = DFA.init(allocator, interner, table, root_id),
+            .interner = interner,
+            .table = table,
+            .fwd_dfa = DFA.init(allocator, interner, table, root_id),
+            .rev_dfa = DFA.init(allocator, interner, table, rev_starred),
             .allocator = allocator,
             .startset = startset,
         };
     }
 
     pub fn deinit(self: *Regex) void {
-        self.dfa_state.deinit();
+        self.fwd_dfa.deinit();
+        self.rev_dfa.deinit();
+        self.interner.deinit();
+        self.allocator.destroy(self.interner);
+        self.allocator.destroy(self.table);
     }
 
     /// Find the first (leftmost-longest) match.
+    /// Always uses startset skip + forward scan — reverse DFA is pointless for
+    /// a single match (you'd scan the whole input backwards just to find the first).
     pub fn find(self: *Regex, input: []const u8) !?Span {
-        var start: usize = 0;
-        while (start <= input.len) {
-            // Use startset to skip to next candidate position
-            if (startset_mod.findNextCandidate(&self.startset, input, start)) |candidate| {
-                start = candidate;
-            } else {
-                break;
+        var pos: usize = 0;
+        while (startset_mod.findNextCandidate(&self.startset, input, pos)) |candidate| {
+            if (try self.fwd_dfa.maxEnd(input, candidate)) |end| {
+                return Span{ .start = candidate, .end = end };
             }
-            if (try self.dfa_state.maxEnd(input, start)) |end| {
-                return Span{ .start = start, .end = end };
-            }
-            start += 1;
+            pos = candidate + 1;
         }
         return null;
     }
 
     /// Find all non-overlapping leftmost-longest matches.
+    /// Uses startset skip when available (SIMD-fast for literals/alternations).
+    /// Falls back to reverse DFA two-phase for dense/nullable patterns where
+    /// startset can't help — the reverse pass marks all candidate starts in one
+    /// O(n) sweep, avoiding quadratic re-scanning.
     pub fn findAll(self: *Regex, allocator: Allocator, input: []const u8) ![]Span {
         var matches: std.ArrayList(Span) = .empty;
         errdefer matches.deinit(allocator);
 
-        var start: usize = 0;
-        while (start <= input.len) {
-            // Use startset to skip to next candidate position
-            const candidate = startset_mod.findNextCandidate(&self.startset, input, start) orelse break;
-            start = candidate;
-
-            if (try self.dfa_state.maxEnd(input, start)) |end| {
-                try matches.append(allocator, Span{ .start = start, .end = end });
-                // Advance past the match; for empty matches, advance by 1
-                if (end == start) {
-                    start += 1;
-                } else {
-                    start = end;
+        switch (self.startset) {
+            .single, .bitmap => {
+                // Fast path: SIMD/bitmap skip to candidates
+                var pos: usize = 0;
+                while (startset_mod.findNextCandidate(&self.startset, input, pos)) |candidate| {
+                    if (try self.fwd_dfa.maxEnd(input, candidate)) |end| {
+                        try matches.append(allocator, Span{ .start = candidate, .end = end });
+                        pos = if (end == candidate) candidate + 1 else end;
+                    } else {
+                        pos = candidate + 1;
+                    }
                 }
-            } else {
-                start += 1;
-            }
+            },
+            .none => {
+                // Dense pattern: reverse DFA marks all candidate starts in one pass
+                const starts = try allocator.alloc(bool, input.len + 1);
+                defer allocator.free(starts);
+                @memset(starts, false);
+                try self.rev_dfa.findStarts(input, starts);
+
+                var pos: usize = 0;
+                while (pos <= input.len) {
+                    if (!starts[pos]) {
+                        pos += 1;
+                        continue;
+                    }
+                    if (try self.fwd_dfa.maxEnd(input, pos)) |end| {
+                        try matches.append(allocator, Span{ .start = pos, .end = end });
+                        pos = if (end == pos) pos + 1 else end;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            },
         }
 
         return matches.toOwnedSlice(allocator);
     }
 
-    /// Count the number of non-overlapping matches (like resharp's Count API).
+    /// Count the number of non-overlapping matches.
+    /// Same hybrid strategy as findAll: startset skip for sparse, reverse DFA for dense.
     pub fn count(self: *Regex, input: []const u8) !usize {
         var n: usize = 0;
-        var start: usize = 0;
-        while (start <= input.len) {
-            // Use startset to skip to next candidate position
-            const candidate = startset_mod.findNextCandidate(&self.startset, input, start) orelse break;
-            start = candidate;
 
-            if (try self.dfa_state.maxEnd(input, start)) |end| {
-                n += 1;
-                if (end == start) {
-                    start += 1;
-                } else {
-                    start = end;
+        switch (self.startset) {
+            .single, .bitmap => {
+                var pos: usize = 0;
+                while (startset_mod.findNextCandidate(&self.startset, input, pos)) |candidate| {
+                    if (try self.fwd_dfa.maxEnd(input, candidate)) |end| {
+                        n += 1;
+                        pos = if (end == candidate) candidate + 1 else end;
+                    } else {
+                        pos = candidate + 1;
+                    }
                 }
-            } else {
-                start += 1;
-            }
+            },
+            .none => {
+                const starts = try self.allocator.alloc(bool, input.len + 1);
+                defer self.allocator.free(starts);
+                @memset(starts, false);
+                try self.rev_dfa.findStarts(input, starts);
+
+                var pos: usize = 0;
+                while (pos <= input.len) {
+                    if (!starts[pos]) {
+                        pos += 1;
+                        continue;
+                    }
+                    if (try self.fwd_dfa.maxEnd(input, pos)) |end| {
+                        n += 1;
+                        pos = if (end == pos) pos + 1 else end;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            },
         }
+
         return n;
     }
 };

@@ -68,7 +68,7 @@ fn benchCount(
     defer re.deinit();
 
     // -- Reset profile counters before search loop --
-    re.dfa_state.profile.reset();
+    re.fwd_dfa.profile.reset();
 
     // -- Measure search time --
     var search_iters: u64 = 0;
@@ -82,7 +82,7 @@ fn benchCount(
     }
 
     // -- Capture profile data (accumulated across all search iterations) --
-    const profile = re.dfa_state.profile;
+    const profile = re.fwd_dfa.profile;
 
     const avg_compile_ns = compile_total_ns / compile_iters;
     const avg_search_ns = search_total_ns / search_iters;
